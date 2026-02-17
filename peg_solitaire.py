@@ -4,7 +4,7 @@ import cvxpy as cp
 import numpy as np
 
 # Defining the matrix describing the board
-N = 7 # size square
+N = 9 # size square
 width_cross = math.ceil(N/3)
 width_left_part = math.ceil((N - width_cross)/2)
 width_right_part = N - width_cross - width_left_part
@@ -13,8 +13,144 @@ top_line = [-1 if x < width_left_part or x >= width_left_part + width_cross else
 middle_line = [1 for x in range(N)]
 standard_board = [top_line.copy() if x < width_left_part or x >= width_left_part + width_cross else middle_line.copy() for x in range(N)]
 standard_board[origin[1]][origin[0]] = 0
-standard_board[2][4] = 1
-standard_board[3][4] = 1
+
+# --- Bitboard infrastructure (precomputed at module load) ---
+
+# 2a. Position mapping: map each playable (x,y) to a bit index
+PLAYABLE_POSITIONS = []
+POS_TO_BIT = {}
+for _y in range(N):
+    for _x in range(N):
+        if standard_board[_y][_x] != -1:
+            POS_TO_BIT[(_x, _y)] = len(PLAYABLE_POSITIONS)
+            PLAYABLE_POSITIONS.append((_x, _y))
+BIT_TO_POS = PLAYABLE_POSITIONS
+NUM_POSITIONS = len(PLAYABLE_POSITIONS)
+
+# 2b. Move table: for each directed jump, precompute bitmasks
+MOVES = []
+for _y in range(N):
+    for _x in range(N):
+        if standard_board[_y][_x] == -1:
+            continue
+        # Horizontal right
+        if _x + 2 < N and standard_board[_y][_x+1] != -1 and standard_board[_y][_x+2] != -1:
+            _fb = POS_TO_BIT[(_x, _y)]
+            _jb = POS_TO_BIT[(_x+1, _y)]
+            _tb = POS_TO_BIT[(_x+2, _y)]
+            _fm, _jm, _tm = 1 << _fb, 1 << _jb, 1 << _tb
+            MOVES.append((_fb, _jb, _tb, _fm, _jm, _tm, _fm | _jm | _tm))
+            # Reverse direction
+            MOVES.append((_tb, _jb, _fb, _tm, _jm, _fm, _fm | _jm | _tm))
+        # Vertical down
+        if _y + 2 < N and standard_board[_y+1][_x] != -1 and standard_board[_y+2][_x] != -1:
+            _fb = POS_TO_BIT[(_x, _y)]
+            _jb = POS_TO_BIT[(_x, _y+1)]
+            _tb = POS_TO_BIT[(_x, _y+2)]
+            _fm, _jm, _tm = 1 << _fb, 1 << _jb, 1 << _tb
+            MOVES.append((_fb, _jb, _tb, _fm, _jm, _tm, _fm | _jm | _tm))
+            # Reverse direction
+            MOVES.append((_tb, _jb, _fb, _tm, _jm, _fm, _fm | _jm | _tm))
+
+# 2c. D4 symmetry permutation tables (8 symmetries of the cross board)
+_center = N // 2
+
+def _rot90(x, y):
+    return (_center + (_center - y), _center + (x - _center))
+
+def _rot180(x, y):
+    return (N - 1 - x, N - 1 - y)
+
+def _rot270(x, y):
+    return (_center + (y - _center), _center + (_center - x))
+
+def _refl_v(x, y):
+    return (N - 1 - x, y)
+
+def _refl_h(x, y):
+    return (x, N - 1 - y)
+
+def _refl_d1(x, y):
+    return (y, x)
+
+def _refl_d2(x, y):
+    return (N - 1 - y, N - 1 - x)
+
+SYMMETRY_PERMS = []
+for _transform in [lambda x, y: (x, y), _rot90, _rot180, _rot270, _refl_v, _refl_h, _refl_d1, _refl_d2]:
+    _perm = []
+    for _i, (_px, _py) in enumerate(PLAYABLE_POSITIONS):
+        _nx, _ny = _transform(_px, _py)
+        _perm.append(POS_TO_BIT[(_nx, _ny)])
+    SYMMETRY_PERMS.append(tuple(_perm))
+
+def _apply_symmetry(state, perm):
+    result = 0
+    temp = state
+    while temp:
+        bit = temp & (-temp)
+        src_idx = bit.bit_length() - 1
+        result |= (1 << perm[src_idx])
+        temp ^= bit
+    return result
+
+def canonical_state(state):
+    canon = state
+    for perm in SYMMETRY_PERMS[1:]:
+        transformed = _apply_symmetry(state, perm)
+        if transformed < canon:
+            canon = transformed
+    return canon
+
+# 2d. Per-position move lookup and center distance
+_center_pos = (N // 2, N // 2)
+CENTER_DIST = [abs(x - _center_pos[0]) + abs(y - _center_pos[1]) for x, y in PLAYABLE_POSITIONS]
+
+# MOVES_BY_POS[i] = list of (jumped_idx, to_idx, jumped_mask, to_mask, xor_mask)
+MOVES_BY_POS = [[] for _ in range(NUM_POSITIONS)]
+for _fb, _jb, _tb, _fm, _jm, _tm, _xm in MOVES:
+    MOVES_BY_POS[_fb].append((_jb, _tb, _jm, _tm, _xm))
+
+# Sort each position's moves: prefer landing closer to center
+for _pos_moves in MOVES_BY_POS:
+    _pos_moves.sort(key=lambda m: CENTER_DIST[m[1]])
+
+# 2e. Chunk-based fast canonical state computation
+# Split 45-bit state into 3 chunks of 15 bits each for lookup-table symmetry
+_CHUNK_SIZE = 15
+_NUM_CHUNKS = (NUM_POSITIONS + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+_CHUNK_MASK = (1 << _CHUNK_SIZE) - 1
+
+SYMMETRY_CHUNK_TABLES = []
+for _perm in SYMMETRY_PERMS:
+    _chunk_tables = []
+    for _chunk_idx in range(_NUM_CHUNKS):
+        _start_bit = _chunk_idx * _CHUNK_SIZE
+        _end_bit = min(_start_bit + _CHUNK_SIZE, NUM_POSITIONS)
+        _chunk_len = _end_bit - _start_bit
+        _table = [0] * (1 << _chunk_len)
+        for _val in range(1 << _chunk_len):
+            _result = 0
+            for _bit_pos in range(_chunk_len):
+                if _val & (1 << _bit_pos):
+                    _result |= (1 << _perm[_start_bit + _bit_pos])
+            _table[_val] = _result
+        _chunk_tables.append(_table)
+    SYMMETRY_CHUNK_TABLES.append(_chunk_tables)
+
+def fast_canonical_state(state):
+    """Compute canonical state using chunk lookup tables (much faster)."""
+    canon = state
+    for chunk_tables in SYMMETRY_CHUNK_TABLES[1:]:
+        s = state
+        transformed = chunk_tables[0][s & _CHUNK_MASK]
+        s >>= _CHUNK_SIZE
+        transformed |= chunk_tables[1][s & _CHUNK_MASK]
+        s >>= _CHUNK_SIZE
+        transformed |= chunk_tables[2][s]
+        if transformed < canon:
+            canon = transformed
+    return canon
 
 
 class PegBoard:
@@ -366,7 +502,275 @@ class PegBoard:
         if problem.solve() < -0.0001:
             return False
         return True
-                
+
+    @staticmethod
+    def _precompute_pagoda_weights(goal_bit_index, max_functions=10):
+        """Precompute pagoda function weight vectors for pruning.
+
+        Solves the LP with normalization w@g==1 so the trivial w=0 is excluded.
+        Each weight vector can independently prove a position unsolvable:
+        if sum(w[i] for i in pegs) < 1, the position cannot reach the goal.
+
+        Returns chunk-based lookup tables for fast evaluation.
+        """
+        n = NUM_POSITIONS
+        rows = []
+        seen_moves = set()
+        for fb, jb, tb, _, _, _, _ in MOVES:
+            key = (fb, jb, tb)
+            if key not in seen_moves:
+                seen_moves.add(key)
+                row = [0] * n
+                row[fb] += 1
+                row[jb] += 1
+                row[tb] -= 1
+                rows.append(row)
+
+        A = np.array(rows, dtype=float)
+        g = np.zeros(n)
+        g[goal_bit_index] = 1.0
+
+        w = cp.Variable(n)
+        constraints = [A @ w >= 0, w @ g == 1]
+
+        raw_weights = []
+        rng = np.random.RandomState(42)
+
+        objectives = []
+        # Initial state
+        s_init = np.ones(n)
+        s_init[goal_bit_index] = 0.0
+        objectives.append(s_init)
+
+        # Region-concentrated states
+        for region_center_idx in range(n):
+            s = np.zeros(n)
+            for j in range(n):
+                px, py = PLAYABLE_POSITIONS[j]
+                rx, ry = PLAYABLE_POSITIONS[region_center_idx]
+                if abs(px - rx) + abs(py - ry) <= 2:
+                    s[j] = 1.0
+            objectives.append(s)
+
+        # Random mid-game states
+        for _ in range(20):
+            s = np.zeros(n)
+            num_pegs = rng.randint(3, n - 3)
+            peg_positions = rng.choice(n, size=num_pegs, replace=False)
+            s[peg_positions] = 1.0
+            objectives.append(s)
+
+        param_s = cp.Parameter(n, nonneg=True)
+        objective = cp.Minimize(w @ param_s - 1)
+        problem = cp.Problem(objective, constraints)
+
+        seen_hashes = set()
+        for s_vec in objectives:
+            param_s.value = s_vec
+            try:
+                problem.solve(warm_start=True)
+                if w.value is not None:
+                    weights = w.value.copy()
+                    w_hash = tuple(round(v, 2) for v in weights)
+                    if w_hash not in seen_hashes:
+                        seen_hashes.add(w_hash)
+                        raw_weights.append(weights)
+            except Exception:
+                pass
+
+        # Keep only the most diverse functions (up to max_functions)
+        if len(raw_weights) > max_functions:
+            raw_weights = raw_weights[:max_functions]
+
+        # Build chunk-based lookup tables for fast pagoda evaluation
+        # For each function k, PAGODA_CHUNKS[k][chunk_idx][chunk_val] = sum of weights
+        chunk_size = _CHUNK_SIZE
+        num_chunks = _NUM_CHUNKS
+        pagoda_chunk_tables = []
+        for weights in raw_weights:
+            chunk_tables = []
+            for chunk_idx in range(num_chunks):
+                start_bit = chunk_idx * chunk_size
+                end_bit = min(start_bit + chunk_size, n)
+                chunk_len = end_bit - start_bit
+                table = [0.0] * (1 << chunk_len)
+                for val in range(1 << chunk_len):
+                    s = 0.0
+                    for bit_pos in range(chunk_len):
+                        if val & (1 << bit_pos):
+                            s += weights[start_bit + bit_pos]
+                    table[val] = s
+                chunk_tables.append(table)
+            pagoda_chunk_tables.append(chunk_tables)
+
+        return pagoda_chunk_tables
+
+    def _apply_bitboard_solution(self, solution_moves):
+        """Convert bitboard solution moves to UI format and apply."""
+        for fb, jb, tb in solution_moves:
+            from_pos = BIT_TO_POS[fb]
+            to_pos = BIT_TO_POS[tb]
+            self._play(from_pos, to_pos, True)
+
+    def optimized_compute_solution(self, screen=None, stop=None):
+        """Optimized solver using bitboard, chunk-based symmetry/pagoda, and restarts.
+
+        Key optimizations over previous version:
+        - Chunk lookup tables for canonical state (3 lookups vs ~240 bit iterations)
+        - Chunk lookup tables for pagoda evaluation (3 lookups vs ~30 bit iterations)
+        - Randomized restart DFS to explore diverse paths
+        - Per-piece move generation with arm-clearing heuristic
+        """
+        import time as _time
+        import random as _random
+
+        # Convert current board to bitboard
+        state = 0
+        for (x, y) in self.position_pieces:
+            if (x, y) in POS_TO_BIT:
+                state |= (1 << POS_TO_BIT[(x, y)])
+
+        goal_bit = POS_TO_BIT[self.goal]
+        goal_state = 1 << goal_bit
+        num_initial_pegs = bin(state).count('1')
+
+        if state == goal_state:
+            print("Yay!")
+            return True
+
+        # Precompute pagoda weights with chunk tables
+        print("Precomputing pagoda functions...")
+        pagoda_chunks = self._precompute_pagoda_weights(goal_bit)
+        print(f"Got {len(pagoda_chunks)} pagoda functions for pruning.")
+
+        # Local references for performance
+        _moves_by_pos = MOVES_BY_POS
+        _center_dist = CENTER_DIST
+        _canonical = fast_canonical_state
+        _chunk_mask = _CHUNK_MASK
+        _chunk_size = _CHUNK_SIZE
+
+        def pagoda_prune(s):
+            """Return True if state s is provably unsolvable (chunk-based)."""
+            c0 = s & _chunk_mask
+            c1 = (s >> _chunk_size) & _chunk_mask
+            c2 = s >> (_chunk_size * 2)
+            for chunk_tables in pagoda_chunks:
+                sv = chunk_tables[0][c0] + chunk_tables[1][c1] + chunk_tables[2][c2]
+                if sv < 1.0 - 1e-9:
+                    return True
+            return False
+
+        total_nodes = 0
+        total_pruned = 0
+        start_time = _time.time()
+        nodes_per_restart = 2_000_000
+        max_restarts = 500
+
+        print("Searching with randomized restarts...")
+
+        for attempt in range(max_restarts):
+            rng = _random.Random(attempt)
+
+            # Transposition table per restart (fresh each time to avoid over-constraining)
+            visited = set()
+            canon_init = _canonical(state)
+            visited.add(canon_init)
+            max_visited = 5_000_000
+
+            def generate_moves(s, randomize=False):
+                """Generate valid moves sorted by heuristic with optional randomization."""
+                moves = []
+                temp = s
+                while temp:
+                    bit = temp & (-temp)
+                    pos = bit.bit_length() - 1
+                    for jb, tb, jm, tm, xm in _moves_by_pos[pos]:
+                        if (s & jm) and not (s & tm):
+                            noise = rng.random() * 0.5 if randomize else 0
+                            moves.append((-_center_dist[pos] + noise,
+                                          _center_dist[tb] + noise,
+                                          pos, jb, tb, xm))
+                    temp &= temp - 1
+                moves.sort()
+                return moves
+
+            initial_moves = generate_moves(state, randomize=(attempt > 0))
+            stack = [(state, initial_moves, 0)]
+            solution_path = []
+            nodes = 0
+            pruned = 0
+
+            while stack:
+                nodes += 1
+                if nodes & 0x3FFF == 0:
+                    if stop is not None and stop():
+                        total_nodes += nodes
+                        total_pruned += pruned
+                        elapsed = _time.time() - start_time
+                        print(f"Stopped after {total_nodes} nodes total, {elapsed:.1f}s")
+                        return False
+
+                if nodes >= nodes_per_restart:
+                    break
+
+                cur_state, cur_moves, mi = stack[-1]
+
+                found_move = False
+                while mi < len(cur_moves):
+                    _, _, fb, jb, tb, xm = cur_moves[mi]
+                    mi += 1
+
+                    new_state = cur_state ^ xm
+
+                    # Win check
+                    if new_state == goal_state:
+                        solution_path.append((fb, jb, tb))
+                        self._apply_bitboard_solution(solution_path)
+                        total_nodes += nodes
+                        elapsed = _time.time() - start_time
+                        print(f"Yay! Found in {total_nodes} nodes, "
+                              f"attempt {attempt+1}, {elapsed:.1f}s")
+                        return True
+
+                    # Transposition check (chunk-based canonical)
+                    canon = _canonical(new_state)
+                    if canon in visited:
+                        continue
+
+                    # Pagoda pruning (chunk-based, mid-game only)
+                    pc = bin(new_state).count('1')
+                    if 5 <= pc <= 35 and pagoda_chunks:
+                        if pagoda_prune(new_state):
+                            pruned += 1
+                            continue
+
+                    # Accept move
+                    if len(visited) < max_visited:
+                        visited.add(canon)
+                    solution_path.append((fb, jb, tb))
+                    stack[-1] = (cur_state, cur_moves, mi)
+                    new_moves = generate_moves(new_state, randomize=(attempt > 0))
+                    stack.append((new_state, new_moves, 0))
+                    found_move = True
+                    break
+
+                if not found_move:
+                    stack.pop()
+                    if solution_path:
+                        solution_path.pop()
+
+            total_nodes += nodes
+            total_pruned += pruned
+            if nodes & 0xFFFFF == 0 or attempt % 10 == 0:
+                elapsed = _time.time() - start_time
+                depth = len(solution_path) if solution_path else 0
+                print(f"  Attempt {attempt+1}: {nodes} nodes, max depth reached, "
+                      f"{total_nodes} total, {total_pruned} pruned, {elapsed:.1f}s")
+
+        elapsed = _time.time() - start_time
+        print(f"Nay... {total_nodes} nodes across {max_restarts} attempts, {elapsed:.1f}s")
+        return False
 
 
 def draw_board(board,screen,selected_square=None,godmode=False):
@@ -463,6 +867,13 @@ if __name__ == '__main__':
                                 return True
                         return False
                     board.fast_compute_solution(screen,stop)
+                if event.key == pygame.K_o:
+                    def stop():
+                        for eventt in pygame.event.get():
+                            if eventt.type == pygame.KEYDOWN and eventt.key == pygame.K_o:
+                                return True
+                        return False
+                    board.optimized_compute_solution(screen,stop)
 
                 if event.key == pygame.K_t:
                     print(board.pagoda_fun_test())
